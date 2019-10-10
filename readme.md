@@ -1,7 +1,10 @@
 # FSA-Net.Pytorch
 **[CVPR19] FSA-Net: Learning Fine-Grained Structure Aggregation for Head Pose Estimation from a Single Image**
 
-**Code Author: Tsun-Yi Yang**
+## Official implemention
+
+https://github.com/shamangary/FSA-Net
+
 ## 
 It is a very excellent paper as I think. The method may be used in other regression problem, so I implement it in Pytorch for further studying.
 
