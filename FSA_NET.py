@@ -1,252 +1,304 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-def softmax(input, dim=1):
-    transposed_input = input.transpose(dim, len(input.size()) - 1)
-    softmaxed_output = F.softmax(transposed_input.contiguous().view(-1, transposed_input.size(-1)), dim=-1)
-    return softmaxed_output.view(*transposed_input.size()).transpose(dim, len(input.size()) - 1)
-class BaseBlock(nn.Module):
-    def __init__(self,in_channels,out_channels,activation = "relu"):
-        super(BaseBlock,self).__init__()
-        self.seq = nn.Sequential(
-            nn.Conv2d(in_channels,out_channels,kernel_size = 3,stride = 1,padding=1),
-            nn.BatchNorm2d(out_channels),
-        )        
-        self.activation = nn.ReLU() if activation == "relu" else nn.Tanh()
-    def forward(self,x):
-        x = self.seq(x)
-        return self.activation(x)
-class FeatureExtrator(nn.Module):
-    def __init__(self,in_channels,out_channels=64,pool_size=1):
-        super(FeatureExtrator,self).__init__()
-        self.seq = nn.Sequential(
-            nn.Conv2d(in_channels,out_channels,kernel_size=1),
-            nn.AvgPool2d(pool_size)
-        )
-    def forward(self,x):
-        return self.seq(x)
-
-class ConvUnit(nn.Module):
-    def __init__(self, in_channels):
-        super(ConvUnit, self).__init__()
-
-        self.conv0 = nn.Conv2d(in_channels=in_channels,
-                               out_channels=32,  # fixme constant
-                               kernel_size=9,  # fixme constant
-                               stride=2, # fixme constant
-                               bias=True)
-
-    def forward(self, x):
-        return self.conv0(x)
-
-class CapsuleLayer(nn.Module):
-    def __init__(self, in_units = 21, in_channels = 64, num_units = 3, unit_size = 16, use_routing = True):
-        super(CapsuleLayer, self).__init__()
-
-        self.in_units = in_units
-        self.in_channels = in_channels
-        self.num_units = num_units
-        self.use_routing = use_routing
-
-        if self.use_routing:
-            # In the paper, the deeper capsule layer(s) with capsule inputs (DigitCaps) use a special routing algorithm
-            # that uses this weight matrix.
-            self.W = nn.Parameter(torch.randn(1, in_channels, num_units, unit_size, in_units))
-        else:
-            # The first convolutional capsule layer (PrimaryCapsules in the paper) does not perform routing.
-            # Instead, it is composed of several convolutional units, each of which sees the full input.
-            # It is implemented as a normal convolutional layer with a special nonlinearity (squash()).
-            def create_conv_unit(unit_idx):
-                unit = ConvUnit(in_channels=in_channels)
-                self.add_module("unit_" + str(unit_idx), unit)
-                return unit
-            self.units = [create_conv_unit(i) for i in range(self.num_units)]
-
-    @staticmethod
-    def squash(s):
-        # This is equation 1 from the paper.
-        mag_sq = torch.sum(s**2, dim=2, keepdim=True)
-        mag = torch.sqrt(mag_sq)
-        s = (mag_sq / (1.0 + mag_sq)) * (s / mag)
-        return s
-
-    def forward(self, x):
-        if self.use_routing:
-            return self.routing(x)
-        else:
-            return self.no_routing(x)
-
-    def no_routing(self, x):
-        # Get output for each unit.
-        # Each will be (batch, channels, height, width).
-        u = [self.units[i](x) for i in range(self.num_units)]
-
-        # Stack all unit outputs (batch, unit, channels, height, width).
-        u = torch.stack(u, dim=1)
-
-        # Flatten to (batch, unit, output).
-        u = u.view(x.size(0), self.num_units, -1)
-
-        # Return squashed outputs.
-        return CapsuleLayer.squash(u)
-
-    def routing(self, x):
-        batch_size = x.size(0)
-
-        # (batch, in_units, features) -> (batch, features, in_units)
-        x = x.transpose(1, 2)
-
-        # (batch, features, in_units) -> (batch, features, num_units, in_units, 1)
-        x = torch.stack([x] * self.num_units, dim=2).unsqueeze(4)
-
-        # (batch, features, in_units, unit_size, num_units)
-        W = torch.cat([self.W] * batch_size, dim=0)
-
-        # Transform inputs by weight matrix.
-        # (batch_size, features, num_units, unit_size, 1)
-        u_hat = torch.matmul(W, x)
-
-        # Initialize routing logits to zero.
-        b_ij = torch.zeros(1, self.in_channels, self.num_units, 1)
-
-        # Iterative routing.
-        num_iterations = 3
-        for iteration in range(num_iterations):
-            # Convert routing logits to softmax.
-            # (batch, features, num_units, 1, 1)
-            c_ij = F.softmax(b_ij)
-            c_ij = torch.cat([c_ij] * batch_size, dim=0).unsqueeze(4)
-
-            # Apply routing (c_ij) to weighted inputs (u_hat).
-            # (batch_size, 1, num_units, unit_size, 1)
-            s_j = (c_ij * u_hat).sum(dim=1, keepdim=True)
-
-            # (batch_size, 1, num_units, unit_size, 1)
-            v_j = CapsuleLayer.squash(s_j)
-
-            # (batch_size, features, num_units, unit_size, 1)
-            v_j1 = torch.cat([v_j] * self.in_channels, dim=1)
-
-            # (1, features, num_units, 1)
-            u_vj1 = torch.matmul(u_hat.transpose(3, 4), v_j1).squeeze(4).mean(dim=0, keepdim=True)
-
-            # Update b_ij (routing)
-            b_ij = b_ij + u_vj1
-
-        return v_j.squeeze(1)
-class SSRModule(nn.Module):
+from capsule import CapsuleLayer
+class  SSRLayer(nn.Module):
     def __init__(self,):
-        super(SSRModule,self).__init__()
-        self.en1 = nn.Sequential(nn.Linear(16,3),nn.Tanh()) # en
-        self.p1 = nn.Sequential(nn.Linear(16,3),nn.ReLU()) # p,每个stage的类别的概率
-        self.delta1 = nn.Sequential(nn.Linear(16,1),nn.Tanh()) # delta
-        self.en2 = nn.Sequential(nn.Linear(16,3),nn.Tanh()) # en
-        self.p2 = nn.Sequential(nn.Linear(16,3),nn.ReLU()) # p,每个stage的类别的概率
-        self.delta2 = nn.Sequential(nn.Linear(16,1),nn.Tanh()) # delta
-        self.en3 = nn.Sequential(nn.Linear(16,3),nn.Tanh()) # en
-        self.p3 = nn.Sequential(nn.Linear(16,3),nn.ReLU()) # p,每个stage的类别的概率
-        self.delta3 = nn.Sequential(nn.Linear(16,1),nn.Tanh()) # delta
-    def forward(self,x): # (-1,3,16)
-        #idx = torch.tensor([[0,1,2],[0,1,2],[0,1,2]],dtype = torch.float,requires_grad = False)
-        idx = torch.zeros(x.size(0),3,dtype = torch.float,requires_grad = False)
-        idx[:,0] = 0
-        idx[:,1] = 1
-        idx[:,2] = 2
-        # ()
-        en1 = self.en1(x[:,0,:]) # (-1,3) 
-        p1 = self.p1(x[:,0:1,:])#(-1,1,3)
-        delta1 = self.delta1(x[:,0,:]).squeeze() # (-1,1)
-        en2 = self.en2(x[:,1,:])
-        p2 = self.p2(x[:,1:2,:])
-        delta2 = self.delta2(x[:,1,:]).squeeze()
-        en3 = self.en3(x[:,2,:])
-        p3 = self.p3(x[:,2:,:])
-        delta3 = self.delta3(x[:,2,:]).squeeze()
-        result = torch.zeros(x.size(0),3)
-        result[:,0] = p1.bmm((idx + en1).view(-1,3,1)).squeeze() * 101 / (1 + delta1) / 3
-        result[:,1] = p2.bmm((idx + en2).view(-1,3,1)).squeeze() * 101 / (1 + delta2) / 3 / 3
-        result[:,2] = p3.bmm((idx + en3).view(-1,3,1)).squeeze() * 101 / (1 + delta3) / 3 / 3 / 3
-        return torch.sum(result,dim = 1)
+        super(SSRLayer,self).__init__()
 
-# for 
-class FSA_NET(nn.Module):
-    def __init__(self):
-        super(FSA_NET,self).__init__()
-        self.s1_1 = nn.Sequential(
-            BaseBlock(3,16,activation = "relu"),
-            nn.AvgPool2d(2)
-        )
-        self.s1_2 = nn.Sequential(
-            BaseBlock(16, 32, activation = "relu"),
-            nn.AvgPool2d(2),
-            BaseBlock(32, 64, activation="relu"),
-            nn.AvgPool2d(2)
-        )
-        self.s1_3 = nn.Sequential(
-            BaseBlock(64, 128),
-            BaseBlock(128, 128)
-        )
-        self.s2_1 = nn.Sequential(
-            BaseBlock(3,16,activation = "tanh"),
-            nn.MaxPool2d(2)
-        )
-        self.s2_2 = nn.Sequential(
-            BaseBlock(16, 32, activation = "tanh"),
-            nn.MaxPool2d(2),
-            BaseBlock(32, 64, activation = "tanh"),
-            nn.MaxPool2d(2)
-        )
-        self.s2_3 = nn.Sequential(
-            BaseBlock(64, 128),
-            BaseBlock(128, 128)
-        )
-        self.u1 = FeatureExtrator(16,64,4)
-        self.u2 = FeatureExtrator(64,64,1)
-        self.u3 = FeatureExtrator(128,64,1)
-
-        self.score1 = nn.Conv2d(64,1,kernel_size = 1)
-        self.score2 = nn.Conv2d(64,1,kernel_size = 1)
-        self.score3 = nn.Conv2d(64,1,kernel_size = 1)
-        self.fc1 = nn.Linear(1,15)
-        self.fc2 = nn.Linear(1,15)
-        self.fc3 = nn.Linear(1,15)
-        self.fc4 = nn.Linear(64*3,35)
-        self.caps = CapsuleLayer(in_channels = 64)
-        self.ssr_result = SSRModule()
     def forward(self,x):
+        a = x[0][:, :, 0] * 0
+        b = x[0][:, :, 0] * 0
+        c = x[0][:, :, 0] * 0
+
+        s1 = 3
+        s2 = 3
+        s3 = 3
+        lambda_d = 1
+
+        di = s1 // 2
+        dj = s2 // 2
+        dk = s3 // 2
+
+        V = 99
+
+        for i in range(0, s1):
+            a = a + (i - di + x[6]) * x[0][:, :, i]
+        a = a / (s1 * (1 + lambda_d * x[3]))
+
+        for j in range(0, s2):
+            b = b + (j - dj + x[7]) * x[1][:, :, j]
+        b = b / (s1 * (1 + lambda_d * x[3])) / (s2 * (1 + lambda_d * x[4]))
+
+        for k in range(0, s3):
+            c = c + (k - dk + x[8]) * x[2][:, :, k]
+        c = c / (s1 * (1 + lambda_d * x[3])) / (s2 * (1 + lambda_d * x[4])) / (
+            s3 * (1 + lambda_d * x[5]))
+
+        pred = (a + b + c) * V
+
+        return pred
+
+def  MatrixNorm(x): #(-1,c/3,8*8*3)
+    # (-1,c/3,64)
+    return torch.sum(x,dim = -1,keepdims = True).repeat(1,1,64)
+
+def PrimCaps(x):
+    x1,x2,norm = x
+    return (x1@x2)/norm
+
+def AggregatedFeatureExtraction(x,num_capsule = 3): # (-1,3,16)
+    s1_a = 0
+    s1_b = num_capsule//3
+    feat_s1_div = x[:,s1_a:s1_b,:] # x[:,0:1,:] (-1,1,16)
+    s2_a = num_capsule//3
+    s2_b = 2*num_capsule//3
+    feat_s2_div = x[:,s2_a:s2_b,:]
+    s3_a = 2*num_capsule//3
+    s3_b = num_capsule
+    feat_s3_div = x[:,s3_a:s3_b,:]
+
+    return feat_s1_div, feat_s2_div, feat_s3_div
+
+class FSANet(nn.Module):
+    def __init__(self, S_set):
+        super(FSANet,self).__init__()
+        self.ssr_layer = SSRLayer()
+        self.num_capsule = S_set[0] # 3
+        self.dim_capsule = S_set[1] # 16
+        self.routings = S_set[2] # 2
+
+        self.num_primcaps = S_set[3] # 8*8*3
+        self.m_dim = S_set[4] # 5
+        # (-1,c,64) @ (-1,64,16) -> (-1,c,16)
+        #self.w1 = nn.Parameter(torch.randn(1,64,16))
+        # (-1,16,c) @ (-1,c,3) -> (-1,16,3)
+        #self.w2 = nn.Parameter(torch.randn(1,self.num_primcaps,3))
+        self.capsule_layer = CapsuleLayer(in_units=self.num_primcaps,in_channels=64,num_units=self.num_capsule,unit_size=self.dim_capsule)
+        self.x_layer1 = nn.Sequential(
+            nn.Conv2d(3,16,3,1,1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace = True),
+            nn.AvgPool2d(2)
+        )
+        self.x_layer2 = nn.Sequential(
+            nn.Conv2d(16,32,3,1,1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace = True),
+            nn.Conv2d(32,32,3,1,1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace = True),
+            nn.AvgPool2d(2)
+        )
+        self.x_layer3 = nn.Sequential(
+            nn.Conv2d(32,64,3,1,1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace = True),
+            nn.Conv2d(64,64,3,1,1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace = True),
+            nn.AvgPool2d(2)
+        )
+        self.x_layer4 = nn.Sequential(
+            nn.Conv2d(64,128,3,1,1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace = True),
+            nn.Conv2d(128,128,3,1,1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace = True),
+        )
+        self.s_layer1 = nn.Sequential(
+            nn.Conv2d(3,16,3,1,1),
+            nn.BatchNorm2d(16),
+            nn.Tanh(),
+            nn.MaxPool2d(2)
+        )
+        self.s_layer2 = nn.Sequential(
+            nn.Conv2d(16,32,3,1,1),
+            nn.BatchNorm2d(32),
+            nn.Tanh(),
+            nn.Conv2d(32,32,3,1,1),
+            nn.BatchNorm2d(32),
+            nn.Tanh(),
+            nn.MaxPool2d(2)
+        )
+        self.s_layer3 = nn.Sequential(
+            nn.Conv2d(32,64,3,1,1),
+            nn.BatchNorm2d(64),
+            nn.Tanh(),
+            nn.Conv2d(64,64,3,1,1),
+            nn.BatchNorm2d(64),
+            nn.Tanh(),
+            nn.MaxPool2d(2)
+        )
+        self.s_layer4 = nn.Sequential(
+            nn.Conv2d(64,128,3,1,1),
+            nn.BatchNorm2d(128),
+            nn.Tanh(),
+            nn.Conv2d(128,128,3,1,1),
+            nn.BatchNorm2d(128),
+            nn.Tanh(),
+        )
+        self.x_layer4_ = nn.Sequential(
+            nn.Conv2d(128,64,1,1,0),
+            nn.ReLU(inplace = True)
+        )
+        self.x_layer3_ = nn.Sequential(
+            nn.Conv2d(64,64,1,1,0),
+            nn.ReLU(inplace = True)
+        )
+        self.x_layer2_ = nn.Sequential(
+            nn.Conv2d(32,64,1,1,0),
+            nn.ReLU(inplace = True)
+        )
+        self.s_layer4_ = nn.Sequential(
+            nn.Conv2d(128,64,1,1,0),
+            nn.Tanh()
+        )
+        self.s_layer3_ = nn.Sequential(
+            nn.Conv2d(64,64,1,1,0),
+            nn.Tanh()
+        )
+        self.s_layer2_ = nn.Sequential(
+            nn.Conv2d(32,64,1,1,0),
+            nn.Tanh()
+        )
+        self.agvpool = nn.AvgPool2d(2)
+        self.feat_preS1 = nn.Sequential(
+            nn.Conv2d(64,1,1,1,0),
+            nn.Sigmoid()
+        )
+        self.feat_preS2 = nn.Sequential(
+            nn.Conv2d(64,1,1,1,0),
+            nn.Sigmoid()
+        )
+        self.feat_preS3 = nn.Sequential(
+            nn.Conv2d(64,1,1,1,0),
+            nn.Sigmoid()
+        )
+        self.sr_matrix1 = nn.Sequential(
+            nn.Linear(8*8,self.m_dim * 8*8*3),
+            nn.Sigmoid()
+        )
+        self.sr_matrix2 = nn.Sequential(
+            nn.Linear(8*8,self.m_dim * 8*8*3),
+            nn.Sigmoid()
+        )
+        self.sr_matrix3 = nn.Sequential(
+            nn.Linear(8*8,self.m_dim * 8*8*3),
+            nn.Sigmoid()
+        )
+        self.SL_matrix = nn.Sequential(
+            nn.Linear(8*8*3,int(self.num_primcaps/3)*self.m_dim),
+            nn.Sigmoid()
+        )
+        self.delta_s1 = nn.Sequential(
+            nn.Linear(4,3),
+            nn.Tanh()
+        )
+        self.delta_s2 = nn.Sequential(
+            nn.Linear(4,3),
+            nn.Tanh()
+        )
+        self.delta_s3 = nn.Sequential(
+            nn.Linear(4,3),
+            nn.Tanh()
+        )
+        self.local_s1 = nn.Sequential(
+            nn.Linear(4,3),
+            nn.Tanh()
+        )
+        self.local_s2 = nn.Sequential(
+            nn.Linear(4,3),
+            nn.Tanh()
+        )
+        self.local_s3 = nn.Sequential(
+            nn.Linear(4,3),
+            nn.Tanh()
+        )
+        self.pred_s1 = nn.Sequential(
+            nn.Linear(8,9),
+            nn.ReLU(inplace = True)
+        )
+        self.pred_s2 = nn.Sequential(
+            nn.Linear(8,9),
+            nn.ReLU(inplace = True)
+        )
+        self.pred_s3 = nn.Sequential(
+            nn.Linear(8,9),
+            nn.ReLU(inplace = True)
+        )
+    def forward(self,x):
+        x_layer1 = self.x_layer1(x) # 32
+        x_layer2 = self.x_layer2(x_layer1) # 16
+        x_layer3 = self.x_layer3(x_layer2) # 8
+        x_layer4 = self.x_layer4(x_layer3) # 8
+
+        s_layer1 = self.s_layer1(x)
+        s_layer2 = self.s_layer2(s_layer1)
+        s_layer3 = self.s_layer3(s_layer2)
+        s_layer4 = self.s_layer4(s_layer3)
+
+        s_layer4_ = self.s_layer4_(s_layer4)
+        x_layer4_ = self.x_layer4_(x_layer4)
+        s_layer3_ = self.s_layer3_(s_layer3)
+        x_layer3_ = self.x_layer3_(x_layer3)
+        s_layer2_ = self.s_layer2_(s_layer2)
+        x_layer2_ = self.x_layer2_(x_layer2)
+        feat_s1_pre = s_layer4_ * x_layer4_ # (-1,64,8,8)
+        feat_s2_pre = s_layer3_ * x_layer3_ # (-1,64,8,8)
+        feat_s3_pre = s_layer2_ * x_layer2_ 
+        feat_s3_pre = self.agvpool(feat_s3_pre) #(-1,64,8,8)
         
-        s1_1 = self.s1_1(x)
-        s1_2 = self.s1_2(s1_1)
-        s1_3 = self.s1_3(s1_2)
+        feat_preS1 = self.feat_preS1(feat_s1_pre).view(-1,8*8)
+        feat_preS2 = self.feat_preS2(feat_s2_pre).view(-1,8*8)
+        feat_preS3 = self.feat_preS3(feat_s3_pre).view(-1,8*8)
 
-        s2_1 = self.s2_1(x)
-        s2_2 = self.s2_2(s2_1)
-        s2_3 = self.s2_3(s2_2)
-        u1 = self.u1(s1_1 * s2_1)
-        u2 = self.u2(s1_2 * s2_2)
-        u3 = self.u3(s1_3 * s2_3)
-        A1,A2,A3 = self.score1(u1),self.score2(u2),self.score3(u3)
-        U = torch.cat([u1.view(-1,8,8,64,1),u2.view(-1,8,8,64,1),u3.view(-1,8,8,64,1)],dim = -1).view(-1,64,64,3).permute(0,1,3,2).contiguous().view(-1,64*3,64)
-        def A2M(A1,A2,A3,U):# w,h,1 (hw3,c)
-            
-            M1 = F.sigmoid(self.fc1(A1.view(-1,A1.size(1) * A1.size(2),1))).view(A1.size(0),3*64,5).permute(0,2,1)
-            
-            M2 = F.sigmoid(self.fc2(A2.view(-1,A2.size(1) * A2.size(2),1))).view(A1.size(0),3*64,5).permute(0,2,1)
-            
-            M3 = F.sigmoid(self.fc3(A3.view(-1,A3.size(1) * A3.size(2),1))).view(A1.size(0),3*64,5).permute(0,2,1)
-            
-            A = torch.cat([A1,A2,A3],dim = -1) # (-1,8,8,3)
-            C = F.sigmoid(self.fc4(A.view(-1,64*3)).view(-1,7,5)) #(-1,7,5)
-            return torch.cat([torch.bmm(C,M1).bmm(U),torch.bmm(C,M2).bmm(U),torch.bmm(C,M3).bmm(U)],dim = 1) # (7*3,c)
-        U_new = A2M(A1,A2,A3,U).view(-1,3*7,64) #(-1,21,64)
-        U_caps = self.caps(U_new).view(-1,3,16)
-        return self.ssr_result(U_caps)
-    
+        sr_matrix1 = self.sr_matrix1(feat_preS1).view(-1,5,8*8*3)
+        sr_matrix2 = self.sr_matrix2(feat_preS2).view(-1,5,8*8*3)
+        sr_matrix3 = self.sr_matrix3(feat_preS3).view(-1,5,8*8*3)
+        
+        feat_pre_concat = torch.cat([feat_preS1,feat_preS2,feat_preS3],dim = 1) # (-1,8*8*3)
+        SL_matrix = self.SL_matrix(feat_pre_concat).view(-1,int(self.num_primcaps/3),int(self.m_dim)) # (-1,c/3,5)
+        S_matrix_s1 = SL_matrix @ sr_matrix1 # (-1,c/3,8*8*3)
+        S_matrix_s2 = SL_matrix @ sr_matrix2
+        S_matrix_s3 = SL_matrix @ sr_matrix3
+        
+        norm_S_s1 = MatrixNorm(S_matrix_s1)
+        norm_S_s2 = MatrixNorm(S_matrix_s2)
+        norm_S_s3 = MatrixNorm(S_matrix_s3)
 
-if __name__ == "__main__":
-    
-    net = FSA_NET()
-    x = torch.randn(1,3,64,64)
-    print(net(x).size())
-    from torchsummary import summary
-    summary(net,(3,64,64),device = "cpu")
+        feat_s1_pre = feat_s1_pre.view(-1,8*8,64).transpose(1,2).contiguous()
+        feat_s2_pre = feat_s2_pre.view(-1,8*8,64).transpose(1,2).contiguous()
+        feat_s3_pre = feat_s3_pre.view(-1,8*8,64).transpose(1,2).contiguous()
+        feat_pre_concat = torch.cat([feat_s1_pre,feat_s2_pre,feat_s3_pre],dim = 1)
+        primcaps_s1 = PrimCaps([S_matrix_s1,feat_pre_concat, norm_S_s1]) # (-1,c/3,8*8*3) @ (-1,64*3,64) -> (-1,c/3,64)
+        primcaps_s2 = PrimCaps([S_matrix_s2,feat_pre_concat, norm_S_s2])
+        primcaps_s3 = PrimCaps([S_matrix_s3,feat_pre_concat, norm_S_s3])
+
+        primcaps = torch.cat([primcaps_s1,primcaps_s2,primcaps_s3],dim = 1) # (-1,c,64)
+        #metric_feat = primcaps @ self.w1
+        #metric_feat = (metric_feat.permute(0,2,1) @ self.w2).permute(0,2,1) #(-1,3,16)
+        capsule = self.capsule_layer(primcaps)
+        feat_s1_div, feat_s2_div, feat_s3_div = AggregatedFeatureExtraction(capsule) # (-1,1,16)
+        feat_s1_div = feat_s1_div.view(-1,16)
+        feat_s2_div = feat_s2_div.view(-1,16)
+        feat_s3_div = feat_s3_div.view(-1,16)
+        feat_delta_s1,feat_local_s1,feat_pred_s1 = feat_s1_div[:,0:4],feat_s1_div[:,4:8],feat_s1_div[:,8:16]
+        feat_delta_s2,feat_local_s2,feat_pred_s2 = feat_s2_div[:,0:4],feat_s2_div[:,4:8],feat_s2_div[:,8:16]
+        feat_delta_s3,feat_local_s3,feat_pred_s3 = feat_s3_div[:,0:4],feat_s3_div[:,4:8],feat_s3_div[:,8:16]
+        
+        
+        delta_s1 = self.delta_s1(feat_delta_s1)
+        delta_s2 = self.delta_s2(feat_delta_s2)
+        delta_s3 = self.delta_s3(feat_delta_s3)
+        
+        local_s1 = self.local_s1(feat_local_s1)
+        local_s2 = self.local_s2(feat_local_s2)
+        local_s3 = self.local_s3(feat_local_s3)
+
+        pred_s1 = self.pred_s1(feat_pred_s1).view(-1,3,3)
+        pred_s2 = self.pred_s2(feat_pred_s2).view(-1,3,3)
+        pred_s3 = self.pred_s3(feat_pred_s3).view(-1,3,3)
+
+        return self.ssr_layer([pred_s1,pred_s2,pred_s3,delta_s1,delta_s2,delta_s3,local_s1,local_s2,local_s3])
