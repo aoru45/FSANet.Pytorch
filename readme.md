@@ -1,6 +1,10 @@
 # FSA-Net.Pytorch
 **[CVPR19] FSA-Net: Learning Fine-Grained Structure Aggregation for Head Pose Estimation from a Single Image**
-
+## My Results
+BIWI dataset(trained on 300W-LP dataset)：
+Intel I7 7500U CPU.
+max inference time：58.09 ms ; min inference time：6.44 ms; average inference time：8.81 ms
+ -pitch: 5.11 -yaw: 4.53 -roll: 3.89 -mae: 4.51
 ## Official implemention
 
 https://github.com/shamangary/FSA-Net
